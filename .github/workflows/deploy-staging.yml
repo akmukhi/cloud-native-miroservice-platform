@@ -1,0 +1,208 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  ENVIRONMENT: staging
+  REGISTRY: gcr.io
+  IMAGE_NAME: ${{ secrets.GCP_PROJECT_ID }}/watch-notification-service
+
+jobs:
+  test:
+    name: Run Full Test Suite
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+        
+    - name: Run unit tests
+      run: |
+        cd backend
+        mvn clean test
+        
+    - name: Run integration tests
+      run: |
+        cd backend
+        mvn verify -DskipUnitTests=true
+        
+    - name: Run performance tests
+      run: |
+        cd backend
+        mvn test -Dtest=PerformanceTestSuite
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-staging
+        path: backend/target/surefire-reports/
+        
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY_STAGING }}
+        project_id: ${{ secrets.GCP_PROJECT_ID_STAGING }}
+        
+    - name: Configure Docker for GCR
+      run: gcloud auth configure-docker
+      
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Deploy to Cloud Run
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: watch-notification-service-staging
+        region: us-central1
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        env_vars: |
+          SPRING_PROFILES_ACTIVE=prod
+          DB_HOST=${{ secrets.DB_HOST_STAGING }}
+          DB_PORT=5432
+          DB_NAME=watchnotify
+          DB_USERNAME=postgres
+        secrets: |
+          DB_PASSWORD=db-password:latest
+          MAIL_USERNAME=mail-username:latest
+          MAIL_PASSWORD=mail-password:latest
+          ADMIN_PASSWORD=admin-password:latest
+        flags: |
+          --memory=1Gi
+          --cpu=1000m
+          --max-instances=10
+          --min-instances=1
+          --allow-unauthenticated
+          
+    - name: Update Cloud Scheduler
+      run: |
+        gcloud scheduler jobs update http watch-notification-scheduler-staging \
+          --schedule="*/15 * * * *" \
+          --uri="${{ steps.deploy.outputs.url }}/api/notifications/send" \
+          --http-method=POST \
+          --headers="Content-Type=application/json" \
+          --message-body='{"watchReleaseId":1,"sendEmail":true,"sendSms":false,"sendPush":true}'
+      if: success()
+      
+    - name: Run comprehensive tests
+      run: |
+        echo "Running comprehensive tests against ${{ steps.deploy.outputs.url }}"
+        
+        # Health check
+        curl -f ${{ steps.deploy.outputs.url }}/actuator/health || exit 1
+        
+        # API tests
+        curl -f ${{ steps.deploy.outputs.url }}/api/users || exit 1
+        curl -f ${{ steps.deploy.outputs.url }}/api/watch-releases || exit 1
+        
+        # Load test (simple)
+        for i in {1..10}; do
+          curl -s ${{ steps.deploy.outputs.url }}/actuator/health > /dev/null
+        done
+        
+        echo "All tests passed!"
+      if: success()
+      
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        text: |
+          Deployment to Staging Environment
+          Status: ${{ job.status }}
+          Commit: ${{ github.sha }}
+          URL: ${{ steps.deploy.outputs.url }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        
+    - name: Create deployment record
+      uses: actions/github-script@v7
+      if: success()
+      with:
+        script: |
+          const { data: deployment } = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'staging',
+            description: 'Deployment to staging environment',
+            auto_merge: false,
+            required_contexts: []
+          });
+          
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.id,
+            state: 'success',
+            environment_url: '${{ steps.deploy.outputs.url }}',
+            description: 'Deployment successful'
+          });

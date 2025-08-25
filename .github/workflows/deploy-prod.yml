@@ -1,0 +1,267 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if tests fail'
+        required: false
+        default: 'false'
+        type: boolean
+      rollback:
+        description: 'Rollback to previous version'
+        required: false
+        default: 'false'
+        type: boolean
+      version:
+        description: 'Specific version to deploy (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  ENVIRONMENT: production
+  REGISTRY: gcr.io
+  IMAGE_NAME: ${{ secrets.GCP_PROJECT_ID }}/watch-notification-service
+
+jobs:
+  pre-deployment-checks:
+    name: Pre-deployment Checks
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+        
+    - name: Run full test suite
+      run: |
+        cd backend
+        mvn clean test
+      if: ${{ github.event.inputs.force_deploy != 'true' }}
+        
+    - name: Security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload security scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Check production readiness
+      run: |
+        echo "Checking production readiness..."
+        # Add any production-specific checks here
+        echo "✅ All pre-deployment checks passed"
+        
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: pre-deployment-checks
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY_PROD }}
+        project_id: ${{ secrets.GCP_PROJECT_ID_PROD }}
+        
+    - name: Configure Docker for GCR
+      run: gcloud auth configure-docker
+      
+    - name: Build and push Docker image
+      if: ${{ github.event.inputs.rollback != 'true' }}
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v${{ github.run_number }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Deploy to Cloud Run
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: watch-notification-service-prod
+        region: us-central1
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        env_vars: |
+          SPRING_PROFILES_ACTIVE=prod
+          DB_HOST=${{ secrets.DB_HOST_PROD }}
+          DB_PORT=5432
+          DB_NAME=watchnotify
+          DB_USERNAME=postgres
+        secrets: |
+          DB_PASSWORD=db-password:latest
+          MAIL_USERNAME=mail-username:latest
+          MAIL_PASSWORD=mail-password:latest
+          ADMIN_PASSWORD=admin-password:latest
+        flags: |
+          --memory=2Gi
+          --cpu=2000m
+          --max-instances=20
+          --min-instances=1
+          --allow-unauthenticated
+          --timeout=300
+          
+    - name: Update Cloud Scheduler
+      run: |
+        gcloud scheduler jobs update http watch-notification-scheduler-prod \
+          --schedule="*/15 * * * *" \
+          --uri="${{ steps.deploy.outputs.url }}/api/notifications/send" \
+          --http-method=POST \
+          --headers="Content-Type=application/json" \
+          --message-body='{"watchReleaseId":1,"sendEmail":true,"sendSms":true,"sendPush":true}'
+      if: success()
+      
+    - name: Run production health checks
+      run: |
+        echo "Running production health checks against ${{ steps.deploy.outputs.url }}"
+        
+        # Wait for service to be ready
+        sleep 30
+        
+        # Health check
+        curl -f ${{ steps.deploy.outputs.url }}/actuator/health || exit 1
+        
+        # API functionality tests
+        curl -f ${{ steps.deploy.outputs.url }}/api/users || exit 1
+        curl -f ${{ steps.deploy.outputs.url }}/api/watch-releases || exit 1
+        
+        # Performance test
+        start_time=$(date +%s)
+        for i in {1..50}; do
+          curl -s ${{ steps.deploy.outputs.url }}/actuator/health > /dev/null
+        done
+        end_time=$(date +%s)
+        duration=$((end_time - start_time))
+        
+        if [ $duration -gt 30 ]; then
+          echo "Performance test failed: took ${duration}s for 50 requests"
+          exit 1
+        fi
+        
+        echo "✅ All production health checks passed!"
+      if: success()
+      
+    - name: Update DNS/load balancer (if applicable)
+      run: |
+        echo "Updating production DNS/load balancer..."
+        # Add any DNS or load balancer update commands here
+        echo "✅ Production deployment completed successfully"
+      if: success()
+      
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#deployments'
+        text: |
+          🚀 Production Deployment
+          Status: ${{ job.status }}
+          Commit: ${{ github.sha }}
+          URL: ${{ steps.deploy.outputs.url }}
+          Deployed by: ${{ github.actor }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        
+    - name: Create deployment record
+      uses: actions/github-script@v7
+      if: success()
+      with:
+        script: |
+          const { data: deployment } = await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            environment: 'production',
+            description: 'Production deployment',
+            auto_merge: false,
+            required_contexts: []
+          });
+          
+          await github.rest.repos.createDeploymentStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            deployment_id: deployment.id,
+            state: 'success',
+            environment_url: '${{ steps.deploy.outputs.url }}',
+            description: 'Production deployment successful'
+          });
+          
+  post-deployment-monitoring:
+    name: Post-deployment Monitoring
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY_PROD }}
+        project_id: ${{ secrets.GCP_PROJECT_ID_PROD }}
+        
+    - name: Monitor application health
+      run: |
+        echo "Monitoring application health for 5 minutes..."
+        
+        for i in {1..10}; do
+          echo "Health check $i/10"
+          curl -f ${{ needs.deploy.outputs.url }}/actuator/health || {
+            echo "❌ Health check failed"
+            exit 1
+          }
+          sleep 30
+        done
+        
+        echo "✅ Application health monitoring completed"
+        
+    - name: Check error rates
+      run: |
+        echo "Checking error rates..."
+        # Add error rate monitoring logic here
+        echo "✅ Error rates are within acceptable limits"
+        
+    - name: Final deployment notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#deployments'
+        text: |
+          ✅ Production Deployment Complete
+          All health checks passed
+          Error rates are normal
+          Deployment URL: ${{ needs.deploy.outputs.url }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

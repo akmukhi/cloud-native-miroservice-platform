@@ -1,0 +1,222 @@
+name: Security Scanning
+
+on:
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Run OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'Watch Notification Service'
+        path: '.'
+        format: 'HTML'
+        out: 'reports'
+        args: >
+          --scan ./backend
+          --failOnCVSS 7
+          --enableRetired
+          
+    - name: Upload dependency scan results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: dependency-scan-results
+        path: reports/
+        
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const reportPath = 'reports/dependency-check-report.html';
+          
+          if (fs.existsSync(reportPath)) {
+            const report = fs.readFileSync(reportPath, 'utf8');
+            const summary = report.match(/<h2>Summary<\/h2>[\s\S]*?<table[\s\S]*?<\/table>/);
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Security Scan Results\n\n${summary ? summary[0] : 'Scan completed. Check artifacts for full report.'}`
+            });
+          }
+          
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Build Docker image
+      run: |
+        cd backend
+        docker build -t watch-notification-service:scan .
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'watch-notification-service:scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Run Snyk container scan
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        image: watch-notification-service:scan
+        args: --severity-threshold=high
+        
+  code-scan:
+    name: Code Security Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: java
+        queries: security-extended,security-and-quality
+        
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        
+    - name: Build with CodeQL
+      run: |
+        cd backend
+        mvn clean compile
+        
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+      
+  secrets-scan:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run TruffleHog
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: .
+        base: HEAD~1
+        head: HEAD
+        
+    - name: Run GitGuardian
+      uses: GitGuardian/ggshield-action@main
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
+      with:
+        command: scan path . --recursive --exit-zero
+        
+  compliance-check:
+    name: Compliance Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Checkov
+      uses: bridgecrewio/checkov-action@master
+      with:
+        directory: terraform/
+        framework: terraform
+        output_format: sarif
+        output_file_path: checkov-results.sarif
+        
+    - name: Upload Checkov results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'checkov-results.sarif'
+        
+  security-report:
+    name: Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [dependency-scan, container-scan, code-scan, secrets-scan, compliance-check]
+    if: always()
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download all scan results
+      uses: actions/download-artifact@v3
+      with:
+        name: dependency-scan-results
+        path: dependency-results/
+        
+    - name: Generate security summary
+      run: |
+        echo "# Security Scan Summary" > security-report.md
+        echo "Generated on: $(date)" >> security-report.md
+        echo "" >> security-report.md
+        echo "## Scan Results" >> security-report.md
+        echo "- Dependency Scan: ${{ needs.dependency-scan.result }}" >> security-report.md
+        echo "- Container Scan: ${{ needs.container-scan.result }}" >> security-report.md
+        echo "- Code Analysis: ${{ needs.code-scan.result }}" >> security-report.md
+        echo "- Secrets Detection: ${{ needs.secrets-scan.result }}" >> security-report.md
+        echo "- Compliance Check: ${{ needs.compliance-check.result }}" >> security-report.md
+        
+    - name: Upload security report
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-report
+        path: security-report.md
+        
+    - name: Notify security team
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        channel: '#security'
+        text: |
+          🔒 Security Scan Complete
+          Dependency Scan: ${{ needs.dependency-scan.result }}
+          Container Scan: ${{ needs.container-scan.result }}
+          Code Analysis: ${{ needs.code-scan.result }}
+          Secrets Detection: ${{ needs.secrets-scan.result }}
+          Compliance Check: ${{ needs.compliance-check.result }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
