@@ -1,0 +1,55 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+# Required variables
+project_id = "your-gcp-project-id"
+region     = "us-central1"
+zone       = "us-central1-a"
+
+# GitHub repository information
+github_owner = "your-github-username"
+github_repo  = "cloud-native-miroservice-platform"
+
+# Database configuration
+db_password = "your-secure-db-password"
+
+# Email configuration (for SMTP)
+mail_username = "your-email@gmail.com"
+mail_password = "your-app-password"
+
+# Application admin password
+admin_password = "your-secure-admin-password"
+
+# Environment
+environment = "dev"
+
+# Database instance tier (for production, consider larger tiers)
+db_instance_tier = "db-f1-micro"
+
+# Cloud Run configuration
+cloud_run_cpu     = "1000m"
+cloud_run_memory  = "512Mi"
+cloud_run_max_scale = 10
+cloud_run_min_scale = 0
+
+# VPC configuration
+vpc_cidr = "10.0.0.0/24"
+
+# Monitoring and logging
+enable_monitoring = true
+enable_logging    = true
+
+# Database backup and maintenance
+backup_retention_days = 7
+maintenance_window_day = 7  # Sunday
+maintenance_window_hour = 3 # 3 AM
+
+# Notification scheduler
+notification_schedule = "*/30 * * * *"  # Every 30 minutes
+
+# Tags
+tags = {
+  Environment = "dev"
+  Project     = "watch-notify"
+  ManagedBy   = "terraform"
+  Owner       = "your-team"
+}

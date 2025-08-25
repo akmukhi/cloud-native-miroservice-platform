@@ -1,0 +1,64 @@
+steps:
+  # Build the application
+  - name: 'gcr.io/cloud-builders/mvn'
+    args: ['clean', 'package', '-DskipTests']
+    dir: 'backend'
+    
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/watch-notification-service:$COMMIT_SHA', '-t', 'gcr.io/$PROJECT_ID/watch-notification-service:latest', '.']
+    dir: 'backend'
+    
+  # Push the Docker image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/watch-notification-service:$COMMIT_SHA']
+    
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/watch-notification-service:latest']
+    
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'watch-notification-service'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/watch-notification-service:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1000m'
+      - '--max-instances'
+      - '10'
+      - '--min-instances'
+      - '0'
+      - '--set-env-vars'
+      - 'SPRING_PROFILES_ACTIVE=prod'
+      - '--update-env-vars'
+      - 'DB_HOST=${_DB_HOST}'
+      - 'DB_PORT=5432'
+      - 'DB_NAME=watchnotify'
+      - 'DB_USERNAME=postgres'
+      - '--update-secrets'
+      - 'DB_PASSWORD=db-password:latest'
+      - 'MAIL_USERNAME=mail-username:latest'
+      - 'MAIL_PASSWORD=mail-password:latest'
+      - 'ADMIN_PASSWORD=admin-password:latest'
+
+# Store images in Google Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/watch-notification-service:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/watch-notification-service:latest'
+
+# Build timeout
+timeout: '1200s'
+
+# Available substitutions
+substitutions:
+  _DB_HOST: 'default'  # This will be replaced with actual DB host from Terraform
